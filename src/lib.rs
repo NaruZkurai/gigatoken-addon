@@ -22,6 +22,7 @@ pub mod bpe;
 pub mod bytes_to_unicode;
 pub mod gguf;
 pub mod gtffi;
+pub mod hftok;
 pub mod pretok;
 
 use std::ffi::CStr;

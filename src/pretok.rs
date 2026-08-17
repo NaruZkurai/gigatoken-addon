@@ -286,6 +286,43 @@ fn parse_tokens_json(body: &str) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// Fetch the model server's HugoayFace-compatible `tokenizer.json`
+/// (`GET /v1/chat_tokenizer`), returning the raw JSON bytes.
+///
+/// This is the byte-exact source of truth for the loaded model and is what a
+/// local tokenizer (gigatoken `load_hf_slice`) consumes to reproduce the
+/// server's exact token ids — enabling fully local tokenization so the server
+/// never processes the prompt text.
+pub fn fetch_tokenizer_json(host: &str, port: u16, timeout_ms: u64) -> Result<Vec<u8>, String> {
+    let path = "/v1/chat_tokenizer";
+    let mut stream = TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(timeout_ms))).ok();
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer local-keyless\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+
+    // Read the whole response; the body is the tokenizer JSON (a few MB).
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let head_end = text.find("\r\n\r\n").unwrap_or(0);
+    // Caller only gets the body; strip the HTTP head.
+    let body_start = if head_end == 0 { 0 } else { head_end + 4 };
+    let body = &raw[raw.len().min(body_start)..];
+    Ok(body.to_vec())
+}
+
 fn parse_input_tokens(body: &str) -> Option<u64> {
     let key = "\"input_tokens\"";
     let idx = body.find(key)?;
