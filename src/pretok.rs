@@ -229,6 +229,63 @@ pub fn count_input_tokens(host: &str, port: u16, model: &str, tokens: &[u32], ti
     Ok(parse_input_tokens(&response_body).unwrap_or(0))
 }
 
+/// Tokenize text through the model server's own tokenizer (`POST /tokenize`).
+///
+/// This is the authoritative tokenizer for a server-served model: the ids it
+/// returns are byte-exact by construction, so the direct-token prompts built
+/// from them are guaranteed correct. Use this instead of a local reconstruction
+/// whenever the model is loaded on a reachable fork server.
+///
+/// `content` may also be a raw token array to round-trip (the server accepts a
+/// mixed text/ids array), but callers want plain text here. `add_special` and
+/// `parse_special` mirror the server flags; `with_pieces` is left off (we only
+/// need ids).
+pub fn tokenize_via_server(
+    host: &str,
+    port: u16,
+    content: &str,
+    add_special: bool,
+    timeout_ms: u64,
+) -> Result<Vec<u32>, String> {
+    let body = format!(
+        "{{\"content\":\"{}\",\"add_special\":{},\"parse_special\":true}}",
+        escape_json_string(content),
+        if add_special { "true" } else { "false" }
+    );
+    let path = "/tokenize";
+
+    let mut stream = TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(timeout_ms))).ok();
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer local-keyless\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    let (status, response_body) = read_response(&mut stream)?;
+    if status != 200 {
+        return Err(format!("tokenize returned {status}: {response_body}"));
+    }
+    parse_tokens_json(&response_body).ok_or_else(|| format!("could not parse tokens from: {response_body}"))
+}
+
+/// Parse the `{"tokens":[...]}` JSON response into a `Vec<u32>`.
+fn parse_tokens_json(body: &str) -> Option<Vec<u32>> {
+    let key = "\"tokens\"";
+    let idx = body.find(key)?;
+    let rest = &body[idx + key.len()..];
+    let start = rest.find('[')? + 1;
+    let end = rest[start..].find(']').map(|e| start + e)?;
+    let mut out = Vec::new();
+    for part in rest[start..end].split(',') {
+        let t = part.trim().parse::<u32>().ok()?;
+        out.push(t);
+    }
+    Some(out)
+}
+
 fn parse_input_tokens(body: &str) -> Option<u64> {
     let key = "\"input_tokens\"";
     let idx = body.find(key)?;
