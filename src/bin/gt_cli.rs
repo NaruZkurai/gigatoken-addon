@@ -29,13 +29,17 @@ fn main() {
     if args.len() >= 4 {
         let host = &args[3]; // e.g. 192.168.2.64
         let port: u16 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6464);
+        let model = args.get(5).cloned().unwrap_or_else(|| "/nzk/models/Ternary-Bonsai-27B-MTP-TQ2_0.gguf".to_string());
         let msg = pretok::Msg {
             role: "user".to_string(),
             parts: vec![pretok::Part::Text(text.clone()), pretok::Part::InputTokens(ids)],
         };
-        println!("POST /v1/chat_pretokenized -> {host}:{port}");
-        match pretok::chat_pretokenized(host, port, "/nzk/models/Ternary-Bonsai-27B-MTP-TQ2_0.gguf", &[msg], 32, 0.0, false, 120_000) {
-            Ok(r) => println!("status {}: {}", r.status, &r.body[..r.body.len().min(300)]),
+        println!("POST /v1/chat_pretokenized -> {host}:{port} model={model}");
+        match pretok::chat_pretokenized(&host, port, &model, &[msg], 32, 0.0, false, 120_000) {
+            Ok(r) => {
+                let truncated: String = r.body.chars().take(300).collect();
+                println!("status {}: {truncated}", r.status);
+            }
             Err(e) => println!("request error: {e}"),
         }
     }
