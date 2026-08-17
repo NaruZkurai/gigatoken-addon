@@ -1,0 +1,16 @@
+[package]
+name = "gigatoken-addon"
+version = "0.1.0"
+edition = "2021"
+description = "Local tokenizer addon for DeepSeek Harness: reads the Bonsai GGUF vocab, tokenizes locally (gigatoken C ABI when available, else a pure-Rust byte-level BPE), and sends pre-tokenized prompts to llama.cpp's /v1/chat_pretokenized direct-token endpoint."
+
+[lib]
+name = "gigatoken_addon"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# No external registry fetches are required to build the core: GGUF parsing,
+# byte-level BPE, and the HTTP client are pure std. libloading is only used to
+# optionally load a gigatoken C-ABI cdylib when one has been built; the crate
+# stays fully functional without it.
+libloading = "0.8"
