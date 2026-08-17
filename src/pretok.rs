@@ -114,50 +114,139 @@ pub fn render_body(
     body
 }
 
-/// Parse the HTTP response into status + optional body.
+/// Parse the HTTP response into status + body string.
+///
+/// Handles the three legitimate body framings properly so JSON bodies are
+/// returned intact:
+///   * `Content-Length` — read exactly that many body bytes.
+///   * `Transfer-Encoding: chunked` — de-chunk the body.
+///   * otherwise — read to EOF (relying on `Connection: close`).
 fn read_response(stream: &mut TcpStream) -> Result<(u16, String), String> {
-    let mut raw = Vec::new();
+    // 1. Read the header block (ending at the blank line).
+    let mut raw: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
-    loop {
-        let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+    let header_end = loop {
+        if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = stream.read(&mut buf).map_err(|e| format!("read headers: {e}"))?;
         if n == 0 {
-            break;
+            return Err("connection closed before headers completed".into());
         }
         raw.extend_from_slice(&buf[..n]);
-        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&raw);
-            let headers_end = head.find("\r\n\r\n").unwrap() + 4;
-            let lower = head.to_ascii_lowercase();
-            // We read until we have the full body for a non-streaming reply; for
-            // streaming we stop at the headers (caller can re-read chunks).
-            let _ = headers_end;
-            let has_encoding = lower.contains("transfer-encoding: chunked") || lower.contains("content-length");
-            if !has_encoding {
-                break;
-            }
-            // For a bounded body we can attempt to read the rest; for SSE we
-            // break on headers and leave the body to the caller.
-            if lower.contains("text/event-stream") {
-                break;
+    };
+
+    let head = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Gather headers (case-insensitive keys).
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().to_ascii_lowercase();
+            match key.as_str() {
+                "content-length" => content_length = val.parse().ok(),
+                "transfer-encoding" => {
+                    if val.contains("chunked") {
+                        chunked = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    let head = String::from_utf8_lossy(&raw);
-    let line = head.lines().next().unwrap_or("");
-    let status: u16 = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // 2. Read the body per its framing.
+    let mut body: Vec<u8> = raw[header_end..].to_vec();
+    if chunked {
+        body = dechunk(&body, stream)?;
+    } else if let Some(len) = content_length {
+        while body.len() < len {
+            let want = (len - body.len()).min(buf.len());
+            let n = stream.read(&mut buf[..want]).map_err(|e| format!("read body: {e}"))?;
+            if n == 0 {
+                break; // short body; return what we got
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        body.truncate(len);
+    } else {
+        // No framing: read to EOF (server uses Connection: close).
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| format!("read body: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+    }
 
-    // Split off body (everything after the blank line).
-    let body = match head.find("\r\n\r\n") {
-        Some(i) => head[i + 4..].to_string(),
-        None => head.clone().into_owned(),
-    };
-    Ok((status, body))
+    let text = String::from_utf8_lossy(&body).into_owned();
+    Ok((status, text))
 }
+
+/// De-chunk an HTTP `Transfer-Encoding: chunked` body. `prefix` may carry body
+/// bytes that arrived with the headers; remaining chunks are read from the
+/// stream. Returns the concatenated plain body.
+fn dechunk(prefix: &[u8], stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut raw: Vec<u8> = prefix.to_vec(); // unconsumed stream buffer
+    let mut pos = 0usize;                   // read cursor into `raw`
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    /// Read more bytes into `raw` until at least `need` unconsumed bytes exist.
+    fn fill(raw: &mut Vec<u8>, pos: usize, need: usize, stream: &mut TcpStream, buf: &mut [u8; 8192]) -> Result<(), String> {
+        while raw.len() - pos < need {
+            let n = stream.read(buf).map_err(|e| format!("read chunk: {e}"))?;
+            if n == 0 {
+                return Err(format!("connection closed mid-chunk (need {need}, have {})", raw.len() - pos));
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        Ok(())
+    }
+
+    loop {
+        // Read the chunk-size line (ends with CRLF).
+        let mut crlf = raw[pos..].windows(2).position(|w| w == b"\r\n").map(|i| i + pos);
+        while crlf.is_none() {
+            let n = stream.read(&mut buf).map_err(|e| format!("read chunk size: {e}"))?;
+            if n == 0 {
+                return Err("connection closed before chunk-size line".into());
+            }
+            raw.extend_from_slice(&buf[..n]);
+            crlf = raw[pos..].windows(2).position(|w| w == b"\r\n").map(|i| i + pos);
+        }
+        let crlf = crlf.unwrap();
+        let line = &raw[pos..crlf];
+        let size_field = line.split(|&b| b == b';').next().unwrap_or(line);
+        let size = usize::from_str_radix(String::from_utf8_lossy(size_field).trim(), 16)
+            .map_err(|e| format!("bad chunk size: {e}"))?;
+        pos = crlf + 2; // move past the size line + CRLF
+        if size == 0 {
+            break; // terminal chunk
+        }
+        // Ensure the chunk data + trailing CRLF are available.
+        fill(&mut raw, pos, size + 2, stream, &mut buf)?;
+        // Copy the chunk data out and compact the buffer.
+        out.extend_from_slice(&raw[pos..pos + size]);
+        pos += size + 2; // skip chunk data + its CRLF
+        if pos > 1 << 20 {
+            raw.drain(..pos);
+            pos = 0;
+        }
+    }
+    Ok(out)
+}
+
+
 
 /// A completed (non-stream) response.
 pub struct Completion {
@@ -304,23 +393,13 @@ pub fn fetch_tokenizer_json(host: &str, port: u16, timeout_ms: u64) -> Result<Ve
     );
     stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
 
-    // Read the whole response; the body is the tokenizer JSON (a few MB).
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(format!("read: {e}")),
-        }
+    // Use the shared framing-aware reader so chunked/Content-Length bodies are
+    // returned intact (the tokenizer.json is several MB and can be chunked).
+    let (status, body) = read_response(&mut stream)?;
+    if status != 200 {
+        return Err(format!("chat_tokenizer returned {status}: {body}"));
     }
-    let text = String::from_utf8_lossy(&raw);
-    let head_end = text.find("\r\n\r\n").unwrap_or(0);
-    // Caller only gets the body; strip the HTTP head.
-    let body_start = if head_end == 0 { 0 } else { head_end + 4 };
-    let body = &raw[raw.len().min(body_start)..];
-    Ok(body.to_vec())
+    Ok(body.into_bytes())
 }
 
 fn parse_input_tokens(body: &str) -> Option<u64> {
